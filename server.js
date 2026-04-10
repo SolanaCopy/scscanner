@@ -1,18 +1,73 @@
+require("dotenv").config();
 const express = require("express");
+const fs = require("fs");
+const path = require("path");
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
 const SCANNER_API_KEY = process.env.SCANNER_API_KEY || "";
 const DASH_KEY = process.env.DASH_KEY || "Tanger2026@";
+const DATA_DIR = path.join(__dirname, "data");
 
-let scannerResults = [];
-let scannerHeartbeat = null;
-let exploitResults = [];
+const SUPPORTED_CHAINS = ['bsc', 'eth'];
+
+// Maak data map aan
+try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) {}
+
+// Laad opgeslagen data bij start
+function loadJson(file) {
+  try { if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, "utf-8")); } catch (e) {}
+  return [];
+}
+function saveJson(file, data) {
+  try { fs.writeFileSync(file, JSON.stringify(data)); } catch (e) {}
+}
+
+// Migratie: bestaande results.json -> bsc-results.json, exploits.json -> bsc-exploits.json
+function migrateOldFiles() {
+  const oldResults = path.join(DATA_DIR, "results.json");
+  const oldExploits = path.join(DATA_DIR, "exploits.json");
+  const newResults = path.join(DATA_DIR, "bsc-results.json");
+  const newExploits = path.join(DATA_DIR, "bsc-exploits.json");
+  try {
+    if (fs.existsSync(oldResults) && !fs.existsSync(newResults)) {
+      fs.renameSync(oldResults, newResults);
+      console.log("[MIGRATE] results.json -> bsc-results.json");
+    }
+    if (fs.existsSync(oldExploits) && !fs.existsSync(newExploits)) {
+      fs.renameSync(oldExploits, newExploits);
+      console.log("[MIGRATE] exploits.json -> bsc-exploits.json");
+    }
+  } catch (e) { console.error("[MIGRATE] fout:", e.message); }
+}
+migrateOldFiles();
+
+// Per-chain data
+function resultsFile(chain) { return path.join(DATA_DIR, chain + "-results.json"); }
+function exploitsFile(chain) { return path.join(DATA_DIR, chain + "-exploits.json"); }
+
+let chainData = {};
+for (const chain of SUPPORTED_CHAINS) {
+  chainData[chain] = {
+    results: loadJson(resultsFile(chain)),
+    exploits: loadJson(exploitsFile(chain)),
+  };
+}
+
+let scannerHeartbeats = { bsc: null, eth: null };
+
+console.log(`[DATA] BSC: ${chainData.bsc.results.length} resultaten + ${chainData.bsc.exploits.length} exploit tests`);
+console.log(`[DATA] ETH: ${chainData.eth.results.length} resultaten + ${chainData.eth.exploits.length} exploit tests`);
 
 function authDash(req, res) {
   const key = req.query.key;
   if (key !== DASH_KEY) { res.status(403).send("Unauthorized"); return false; }
   return true;
+}
+
+function getChain(req) {
+  const c = (req.body && req.body.chain) || req.query.chain || 'bsc';
+  return SUPPORTED_CHAINS.includes(c) ? c : 'bsc';
 }
 
 app.get("/", (_, res) => res.send("ok"));
@@ -22,52 +77,92 @@ app.get("/", (_, res) => res.send("ok"));
 app.post("/api/scanner/heartbeat", (req, res) => {
   const apiKey = req.headers["x-api-key"];
   if (apiKey !== SCANNER_API_KEY) return res.status(403).json({ error: "Unauthorized" });
-  scannerHeartbeat = { ...req.body, ts: Date.now() };
-  return res.json({ ok: true });
+  const chain = getChain(req);
+  scannerHeartbeats[chain] = { ...req.body, ts: Date.now() };
+  return res.json({ ok: true, chain });
 });
 
 app.get("/api/scanner/status", (req, res) => {
   if (!authDash(req, res)) return;
-  if (!scannerHeartbeat) return res.json({ online: false });
-  const age = Date.now() - scannerHeartbeat.ts;
-  return res.json({ online: age < 6 * 60 * 1000, age, ...scannerHeartbeat });
+  const chain = getChain(req);
+  const hb = scannerHeartbeats[chain];
+  if (!hb) return res.json({ online: false, chain });
+  const age = Date.now() - hb.ts;
+  return res.json({ online: age < 6 * 60 * 1000, age, chain, ...hb });
 });
 
 app.post("/api/scanner/results", (req, res) => {
   const apiKey = req.headers["x-api-key"];
   if (apiKey !== SCANNER_API_KEY) return res.status(403).json({ error: "Unauthorized" });
+  const chain = getChain(req);
   let body = req.body;
   if (Array.isArray(body)) {
-    scannerResults = body.slice(0, 500);
+    chainData[chain].results = body.slice(0, 500);
   } else if (body.result) {
-    const idx = scannerResults.findIndex(r => r.address?.toLowerCase() === body.result.address?.toLowerCase());
-    if (idx >= 0) scannerResults[idx] = body.result;
-    else scannerResults.unshift(body.result);
-    if (scannerResults.length > 500) scannerResults.pop();
+    const results = chainData[chain].results;
+    const idx = results.findIndex(r => r.address?.toLowerCase() === body.result.address?.toLowerCase());
+    if (idx >= 0) results[idx] = body.result;
+    else results.unshift(body.result);
+    if (results.length > 500) results.pop();
   }
-  return res.json({ ok: true, count: scannerResults.length });
+  saveJson(resultsFile(chain), chainData[chain].results);
+  return res.json({ ok: true, chain, count: chainData[chain].results.length });
+});
+
+// Pashov AI results endpoint
+app.post("/api/scanner/ai-results", (req, res) => {
+  const apiKey = req.headers["x-api-key"];
+  if (apiKey !== SCANNER_API_KEY) return res.status(403).json({ error: "Unauthorized" });
+  const chain = getChain(req);
+  let body = req.body;
+  if (body.result) {
+    const results = chainData[chain].results;
+    const idx = results.findIndex(r => r.address?.toLowerCase() === body.result.address?.toLowerCase());
+    if (idx >= 0) {
+      results[idx] = { ...results[idx], ...body.result };
+    } else {
+      results.unshift(body.result);
+      if (results.length > 500) results.pop();
+    }
+    saveJson(resultsFile(chain), chainData[chain].results);
+  }
+  return res.json({ ok: true, chain, count: chainData[chain].results.length });
 });
 
 app.get("/api/scanner/results", (req, res) => {
   if (!authDash(req, res)) return;
-  return res.json(scannerResults);
+  const chain = getChain(req);
+  return res.json(chainData[chain].results);
+});
+
+app.delete("/api/scanner/results/:address", (req, res) => {
+  if (!authDash(req, res)) return;
+  const chain = getChain(req);
+  const addr = req.params.address.toLowerCase();
+  chainData[chain].results = chainData[chain].results.filter(r => r.address?.toLowerCase() !== addr);
+  saveJson(resultsFile(chain), chainData[chain].results);
+  return res.json({ ok: true, chain, count: chainData[chain].results.length });
 });
 
 // Exploit results API
 app.post("/api/scanner/exploit", (req, res) => {
   const apiKey = req.headers["x-api-key"];
   if (apiKey !== SCANNER_API_KEY) return res.status(403).json({ error: "Unauthorized" });
+  const chain = getChain(req);
   const result = req.body;
-  const idx = exploitResults.findIndex(r => r.address?.toLowerCase() === result.address?.toLowerCase());
-  if (idx >= 0) exploitResults[idx] = result;
-  else exploitResults.unshift(result);
-  if (exploitResults.length > 200) exploitResults.pop();
-  return res.json({ ok: true });
+  const exploits = chainData[chain].exploits;
+  const idx = exploits.findIndex(r => r.address?.toLowerCase() === result.address?.toLowerCase());
+  if (idx >= 0) exploits[idx] = result;
+  else exploits.unshift(result);
+  if (exploits.length > 200) exploits.pop();
+  saveJson(exploitsFile(chain), chainData[chain].exploits);
+  return res.json({ ok: true, chain });
 });
 
 app.get("/api/scanner/exploit", (req, res) => {
   if (!authDash(req, res)) return;
-  return res.json(exploitResults);
+  const chain = getChain(req);
+  return res.json(chainData[chain].exploits);
 });
 
 // === DASHBOARD ===
@@ -84,6 +179,13 @@ app.get("/scanner", (req, res) => {
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; background: #080b12; color: #c9d1d9; min-height: 100vh; }
+
+  /* Chain tabs */
+  .chain-tabs { display: flex; gap: 0; background: #080b12; border-bottom: 2px solid #21262d; }
+  .chain-tab { padding: 12px 28px; font-size: 15px; font-weight: 700; cursor: pointer; border-bottom: 3px solid transparent; color: #484f58; transition: all 0.2s; }
+  .chain-tab:hover { color: #c9d1d9; }
+  .chain-tab.active[data-chain="bsc"] { color: #f0b429; border-bottom-color: #f0b429; }
+  .chain-tab.active[data-chain="eth"] { color: #627eea; border-bottom-color: #627eea; }
 
   /* Header */
   .header { background: linear-gradient(135deg, #0d1117 0%, #161b22 100%); border-bottom: 1px solid #21262d; padding: 14px 24px; display: flex; align-items: center; justify-content: space-between; }
@@ -180,6 +282,11 @@ app.get("/scanner", (req, res) => {
 </head>
 <body>
 
+<div class="chain-tabs">
+  <div class="chain-tab active" data-chain="bsc" onclick="switchChain('bsc')">&#x1F7E1; BSC</div>
+  <div class="chain-tab" data-chain="eth" onclick="switchChain('eth')">&#x1F535; ETH</div>
+</div>
+
 <div class="header">
   <h1>BSC Scanner <span class="v4">v4</span></h1>
   <div class="clock" id="clock"></div>
@@ -234,8 +341,9 @@ app.get("/scanner", (req, res) => {
         <th onclick="sortBy('totalMedium')">Med</th>
         <th>Verdict</th>
         <th>Details</th>
+        <th></th>
       </tr></thead>
-      <tbody id="results-body"><tr><td colspan="8" class="empty">Laden...</td></tr></tbody>
+      <tbody id="results-body"><tr><td colspan="9" class="empty">Laden...</td></tr></tbody>
     </table>
   </div>
 </div>
@@ -259,12 +367,24 @@ app.get("/scanner", (req, res) => {
 const KEY='${key}';
 let data=[], exploitData=[], currentSort='time', sortDir=-1, currentFilter='all', exploitFilter='all';
 let expandedRows = new Set();
+let currentChain = 'bsc';
+
+function switchChain(chain) {
+  currentChain = chain;
+  document.querySelectorAll('.chain-tab').forEach(t => t.classList.remove('active'));
+  document.querySelector('.chain-tab[data-chain="'+chain+'"]').classList.add('active');
+  document.querySelector('.header h1').innerHTML = (chain === 'bsc' ? 'BSC' : 'ETH') + ' Scanner <span class="v4">v4</span>';
+  document.title = (chain === 'bsc' ? 'BSC' : 'ETH') + ' Scanner v4';
+  expandedRows.clear();
+  fetchAll();
+}
 
 // === HELPERS ===
 function shortAddr(a) { return a ? a.slice(0,6)+'...'+a.slice(-4) : '-'; }
 function fmtBal(v) { return v>=1e6?'$'+(v/1e6).toFixed(1)+'M':v>=1e3?'$'+(v/1e3).toFixed(0)+'k':'$'+(v||0).toFixed(0); }
 function fmtDate(t) { if(!t)return'-'; const d=new Date(t); return d.toLocaleDateString('nl-NL',{day:'2-digit',month:'2-digit'})+' '+d.toLocaleTimeString('nl-NL',{hour:'2-digit',minute:'2-digit'}); }
 function fmtAgo(ms) { const m=Math.floor(ms/60000); if(m<1)return'<1m'; if(m<60)return m+'m'; return Math.floor(m/60)+'u '+m%60+'m'; }
+function explorerUrl() { return currentChain === 'bsc' ? 'https://bscscan.com' : 'https://etherscan.io'; }
 
 function verdict(r) {
   // Check of er een exploit test voor is
@@ -303,6 +423,7 @@ function toggleRow(addr) {
 }
 
 function renderContracts() {
+  const explorer = explorerUrl();
   let f = [...data];
   if (currentFilter==='high') f=f.filter(r=>r.totalHigh>0);
   else if (currentFilter==='50k') f=f.filter(r=>r.balanceUsd>=50000);
@@ -318,7 +439,7 @@ function renderContracts() {
   });
 
   const tb = document.getElementById('results-body');
-  if (!f.length) { tb.innerHTML='<tr><td colspan="8" class="empty">Geen resultaten</td></tr>'; return; }
+  if (!f.length) { tb.innerHTML='<tr><td colspan="9" class="empty">Geen resultaten</td></tr>'; return; }
 
   let html = '';
   for (const r of f) {
@@ -326,17 +447,18 @@ function renderContracts() {
     const isExpl = v.c === 'exploitable';
     html += '<tr class="'+(isExpl?'exploitable':'')+'" style="cursor:pointer" onclick="toggleRow(\\''+r.address+'\\')">';
     html += '<td>'+fmtDate(r.time)+'</td>';
-    html += '<td style="font-weight:600">'+(r.contractName||'-')+'</td>';
-    html += '<td class="addr"><a href="https://bscscan.com/address/'+r.address+'" target="_blank" onclick="event.stopPropagation()">'+shortAddr(r.address)+'</a></td>';
+    html += '<td style="font-weight:600"><a href="'+explorer+'/address/'+r.address+'#code" target="_blank" style="color:#c9d1d9;text-decoration:none" onclick="event.stopPropagation()">'+(r.contractName||'-')+'</a></td>';
+    html += '<td class="addr"><a href="'+explorer+'/address/'+r.address+'" target="_blank" onclick="event.stopPropagation()">'+shortAddr(r.address)+'</a></td>';
     html += '<td style="color:#3fb950;font-weight:700">'+fmtBal(r.balanceUsd)+'</td>';
     html += '<td style="color:'+(r.totalHigh>0?'#f85149':'#30363d')+';font-weight:700">'+(r.totalHigh||0)+'</td>';
     html += '<td style="color:'+(r.totalMedium>0?'#f0b429':'#30363d')+';font-weight:600">'+(r.totalMedium||0)+'</td>';
     html += '<td><span class="badge '+v.c+'">'+v.t+'</span></td>';
     html += '<td style="color:#30363d;font-size:16px">'+(expandedRows.has(r.address)?'\\u25B2':'\\u25BC')+'</td>';
+    html += '<td><button onclick="event.stopPropagation();deleteContract(\\''+r.address+'\\');" style="background:none;border:none;color:#f85149;cursor:pointer;font-size:16px;padding:4px 8px;opacity:0.5" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.5">\\u2715</button></td>';
     html += '</tr>';
 
     if (expandedRows.has(r.address)) {
-      html += '<tr class="finding-row"><td colspan="8"><div class="finding-detail">';
+      html += '<tr class="finding-row"><td colspan="9"><div class="finding-detail">';
       // Slither
       if (r.slither && r.slither.success && r.slither.findings?.length > 0) {
         html += '<div class="finding-card"><h4>Slither ('+r.slither.high+' high, '+r.slither.medium+' med)</h4>';
@@ -385,6 +507,7 @@ function setExploitFilter(f, el) {
 }
 
 function renderExploits() {
+  const explorer = explorerUrl();
   let f = [...exploitData];
   if (exploitFilter==='exploitable') f=f.filter(e=>e.summary?.exploitable>0);
   else if (exploitFilter==='critical') f=f.filter(e=>e.summary?.critical>0||e.summary?.high>0);
@@ -397,7 +520,7 @@ function renderExploits() {
     const hasExpl = ex.summary?.exploitable > 0;
     html += '<div class="exploit-card '+(hasExpl?'has-exploitable':'')+'">';
     html += '<div class="exploit-header">';
-    html += '<h3><a href="https://bscscan.com/address/'+ex.address+'" target="_blank" style="color:'+(hasExpl?'#f85149':'#58a6ff')+';text-decoration:none">'+shortAddr(ex.address)+'</a>';
+    html += '<h3><a href="'+explorer+'/address/'+ex.address+'" target="_blank" style="color:'+(hasExpl?'#f85149':'#58a6ff')+';text-decoration:none">'+shortAddr(ex.address)+'</a>';
     if (hasExpl) html += ' <span class="badge exploitable">EXPLOITABLE</span>';
     html += '</h3>';
     html += '<span class="time">'+fmtDate(ex.timestamp)+'</span></div>';
@@ -434,13 +557,23 @@ function renderExploits() {
   el.innerHTML = html;
 }
 
+// === DELETE CONTRACT ===
+async function deleteContract(addr) {
+  if (!confirm('Contract verwijderen van dashboard?')) return;
+  try {
+    await fetch('/api/scanner/results/'+addr+'?key='+KEY+'&chain='+currentChain, { method: 'DELETE' });
+    data = data.filter(r => r.address?.toLowerCase() !== addr.toLowerCase());
+    renderContracts();
+  } catch(e) { console.error('Delete fout:', e); }
+}
+
 // === DATA FETCHING ===
 async function fetchAll() {
   try {
     const [resR, resS, resE] = await Promise.all([
-      fetch('/api/scanner/results?key='+KEY),
-      fetch('/api/scanner/status?key='+KEY),
-      fetch('/api/scanner/exploit?key='+KEY),
+      fetch('/api/scanner/results?key='+KEY+'&chain='+currentChain),
+      fetch('/api/scanner/status?key='+KEY+'&chain='+currentChain),
+      fetch('/api/scanner/exploit?key='+KEY+'&chain='+currentChain),
     ]);
     data = await resR.json();
     const status = await resS.json();
@@ -490,6 +623,7 @@ async function fetchAll() {
 }
 
 function renderRecentExploits() {
+  const explorer = explorerUrl();
   const el = document.getElementById('recent-exploits');
   const recent = exploitData.slice(0, 5);
   if (!recent.length) {
@@ -501,7 +635,7 @@ function renderRecentExploits() {
     const hasExpl = ex.summary?.exploitable > 0;
     html += '<div class="exploit-card '+(hasExpl?'has-exploitable':'')+'">';
     html += '<div class="exploit-header">';
-    html += '<h3><a href="https://bscscan.com/address/'+ex.address+'" target="_blank" style="color:'+(hasExpl?'#f85149':'#58a6ff')+';text-decoration:none">'+shortAddr(ex.address)+'</a> ';
+    html += '<h3><a href="'+explorer+'/address/'+ex.address+'" target="_blank" style="color:'+(hasExpl?'#f85149':'#58a6ff')+';text-decoration:none">'+shortAddr(ex.address)+'</a> ';
     if (hasExpl) html += '<span class="badge exploitable">EXPLOITABLE</span>';
     else html += '<span class="badge clean">CLEAN</span>';
     html += '</h3><span class="time">'+fmtDate(ex.timestamp)+'</span></div>';
@@ -522,4 +656,4 @@ clock();
 });
 
 const port = process.env.PORT || 3001;
-app.listen(port, "0.0.0.0", () => console.log("BSC Scanner Dashboard on port", port));
+app.listen(port, "0.0.0.0", () => console.log("Scanner Dashboard on port", port));
