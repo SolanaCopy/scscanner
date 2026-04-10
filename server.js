@@ -314,6 +314,7 @@ app.get("/scanner", (req, res) => {
     <div class="stat"><div class="label">Contracten</div><div class="val gold" id="s-contracts">-</div><div class="sub">gevonden</div></div>
     <div class="stat"><div class="label">Alerts</div><div class="val red" id="s-alerts">-</div><div class="sub">verzonden</div></div>
     <div class="stat"><div class="label">Geanalyseerd</div><div class="val green" id="s-analyzed">-</div><div class="sub">Slither/Mythril</div></div>
+    <div class="stat"><div class="label">Pashov AI</div><div class="val purple" id="s-pashov">-</div><div class="sub">audits gedaan</div></div>
     <div class="stat"><div class="label">Exploitable</div><div class="val red" id="s-exploitable">-</div><div class="sub">bevestigd</div></div>
   </div>
 
@@ -390,8 +391,11 @@ function verdict(r) {
   // Check of er een exploit test voor is
   const ex = exploitData.find(e => e.address?.toLowerCase() === r.address?.toLowerCase());
   if (ex && ex.summary?.exploitable > 0) return { t:'EXPLOITABLE', c:'exploitable', s:4 };
+  // Pashov proven = exploitable
+  const pashovProven = (r.pashov?.findings || []).filter(f => f.anvilResult === 'PROVEN').length;
+  if (pashovProven > 0) return { t:'EXPLOITABLE', c:'exploitable', s:4 };
   if (r.totalHigh >= 3) return { t:'GEVAARLIJK', c:'critical', s:3 };
-  if (r.totalHigh >= 1) return { t:'VERDACHT', c:'high', s:2 };
+  if (r.totalHigh >= 1 || (r.pashov?.findings || []).length > 0) return { t:'VERDACHT', c:'high', s:2 };
   if (r.totalMedium >= 1) return { t:'REVIEW', c:'medium', s:1 };
   return { t:'SCHOON', c:'clean', s:0 };
 }
@@ -481,6 +485,21 @@ function renderContracts() {
         for (const f of r.security.findings.slice(0,8)) {
           html += '<div class="finding-item"><span class="sev" style="color:'+(f.severity==='HIGH'?'#f85149':'#f0b429')+'">'+(f.severity==='HIGH'?'\\u25CF':'\\u25CB')+'</span><span><b>'+f.title+'</b> <span style="color:#484f58">'+f.category+'</span></span></div>';
         }
+        html += '</div>';
+      }
+      // Pashov AI Audit
+      if (r.pashov && r.pashov.findings?.length > 0) {
+        const proven = r.pashov.findings.filter(f => f.anvilResult === 'PROVEN').length;
+        const rejected = r.pashov.findings.filter(f => f.anvilResult === 'REJECTED').length;
+        html += '<div class="finding-card" style="border-color:'+(proven>0?'#f8514944':'#a371f733')+'"><h4>\\u{1F3DB} Pashov AI ('+r.pashov.findings.length+' findings, '+proven+' proven, '+rejected+' rejected)</h4>';
+        for (const f of r.pashov.findings.slice(0,10)) {
+          const sevColor = f.severity==='CRITICAL'||f.severity==='HIGH'?'#f85149':f.severity==='MEDIUM'?'#f0b429':'#8b949e';
+          const anvilIcon = f.anvilResult==='PROVEN'?' \\u26A1\\u2705':f.anvilResult==='REJECTED'?' \\u26A1\\u274C':'';
+          html += '<div class="finding-item"><span class="sev" style="color:'+sevColor+'">\\u25CF</span><span><b>['+( f.agent||'?')+']</b> '+(f.description||'').substring(0,180)+anvilIcon;
+          if (f.function) html += ' <code style="color:#a371f7;font-size:10px">'+f.function+'</code>';
+          html += '</span></div>';
+        }
+        if (r.pashov.summary) html += '<div style="margin-top:6px;font-size:11px;color:#8b949e;border-top:1px solid #21262d;padding-top:6px">'+r.pashov.summary+'</div>';
         html += '</div>';
       }
       // Exploit result
@@ -605,7 +624,8 @@ async function fetchAll() {
     document.getElementById('s-contracts').textContent = (status.contracts||data.length||0).toLocaleString();
     document.getElementById('s-alerts').textContent = (status.alerts||0).toLocaleString();
     document.getElementById('s-analyzed').textContent = data.length;
-    document.getElementById('s-exploitable').textContent = exploitData.filter(e=>e.summary?.exploitable>0).length;
+    document.getElementById('s-pashov').textContent = data.filter(r=>r.pashov?.findings?.length>0).length;
+    document.getElementById('s-exploitable').textContent = exploitData.filter(e=>e.summary?.exploitable>0).length + data.filter(r=>(r.pashov?.findings||[]).some(f=>f.anvilResult==='PROVEN')).length;
 
     // Tab counts
     document.getElementById('tab-contracts-count').textContent = data.length;
